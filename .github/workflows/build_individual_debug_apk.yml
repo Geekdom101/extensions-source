@@ -1,0 +1,114 @@
+name: Build individual debug APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      extension_url:
+        description: Paste a CORE extension URL, for example https://github.com/Geekdom101/extensions-source/tree/CORE/src/en/comix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout CORE branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: CORE
+          persist-credentials: false
+
+      - id: extension
+        name: Validate extension URL
+        env:
+          EXTENSION_URL: ${{ inputs.extension_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+
+          url = os.environ["EXTENSION_URL"].strip()
+          parsed = urlsplit(url)
+          parts = parsed.path.rstrip("/").split("/")
+          expected_prefix = ["", "Geekdom101", "extensions-source", "tree", "CORE", "src"]
+
+          if (
+              parsed.scheme != "https"
+              or parsed.netloc.lower() != "github.com"
+              or parsed.query
+              or parsed.fragment
+              or len(parts) != 8
+              or parts[:6] != expected_prefix
+          ):
+              raise SystemExit(
+                  "Enter a URL like "
+                  "https://github.com/Geekdom101/extensions-source/tree/CORE/src/en/comix"
+              )
+
+          lang, extension = parts[6:]
+          valid_segment = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*").fullmatch
+          if not valid_segment(lang) or not valid_segment(extension):
+              raise SystemExit("The language and extension path segments are invalid.")
+
+          module_dir = Path("src", lang, extension)
+          if not (module_dir / "build.gradle.kts").is_file():
+              raise SystemExit(f"No extension module exists at {module_dir} on the CORE branch.")
+
+          module = f":src:{lang}:{extension}"
+          apk_dir = (module_dir / "build/outputs/apk/debug").as_posix()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"module={module}\n")
+              output.write(f"lang={lang}\n")
+              output.write(f"extension={extension}\n")
+              output.write(f"apk_dir={apk_dir}\n")
+
+          print(f"Building {module} from the CORE branch")
+          PY
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-read-only: true
+
+      - name: Build debug APK
+        env:
+          MODULE: ${{ steps.extension.outputs.module }}
+        run: ./gradlew "${MODULE}:assembleDebug"
+
+      - name: Verify APK output
+        env:
+          APK_DIR: ${{ steps.extension.outputs.apk_dir }}
+        run: |
+          shopt -s nullglob
+          apks=("$APK_DIR"/*.apk)
+          if (( ${#apks[@]} == 0 )); then
+            echo "No debug APK was created in $APK_DIR" >&2
+            exit 1
+          fi
+          printf 'Built APK:\n'
+          printf '  %s\n' "${apks[@]}"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-apk-${{ steps.extension.outputs.lang }}-${{ steps.extension.outputs.extension }}
+          path: ${{ steps.extension.outputs.apk_dir }}/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
