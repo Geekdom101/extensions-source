@@ -1,234 +1,197 @@
 package eu.kanade.tachiyomi.extension.pt.blackoutcomics
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.addCookie
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.MarkdownDescription
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.attrOrNull
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.tryParse
-import okhttp3.Cookie
+import keiyoushi.utils.textOrNull
+import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.toJsonRequestBody
+import keiyoushi.utils.tryParseDate
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
-import java.text.SimpleDateFormat
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
-abstract class BlackoutComics : HttpSource() {
+abstract class BlackoutComics : KeiSource() {
+    override fun OkHttpClient.Builder.configureClient() = addCookie(
+        listOf(
+            "age_gate_consent" to """{"consentAt":1790812800000,"expiresAt":2145916800000}""",
+            "_popprepop" to "1",
+        ),
+    )
 
-    override val supportsLatest = true
+    private var searchCsrf: String? = null
 
-    private val baseHttpUrl = baseUrl.toHttpUrl()
-
-    override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor(::ageGateInterceptor)
-        .build()
-
-    override fun headersBuilder() = super.headersBuilder()
-        .add("DNT", "1")
-        .add("Sec-GPC", "1")
-        .add("Upgrade-Insecure-Requests", "1")
-        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        .add("Accept-Language", "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3")
-        .add("Sec-Fetch-Dest", "document")
-        .add("Sec-Fetch-Mode", "navigate")
-        .add("Sec-Fetch-Site", "same-origin")
-
-    // ============================== Popular ===============================
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/ranking", headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val doc = response.asJsoup()
-        val mangas = doc.select(".ranking-grid a.webtoon-card").map { el ->
-            SManga.create().apply {
-                setUrlWithoutDomain(el.attr("abs:href"))
-                title = el.select(".card-title span").text()
-                thumbnail_url = el.select(".card-thumb img").attr("abs:src")
-            }
-        }
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val document = client.get("$baseUrl/ranking", Fetch.DOCUMENT).asJsoup().extractCsrf()
+        val mangas = document.select("#rankingContent a[href*=/comics/]").map { it.toSManga() }
         return MangasPage(mangas, false)
     }
 
-    // =============================== Latest ===============================
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/atualizados-recente?page=$page", headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val doc = response.asJsoup()
-        val mangas = doc.select(".webtoon-grid a.webtoon-card").map { el ->
-            SManga.create().apply {
-                setUrlWithoutDomain(el.attr("abs:href"))
-                title = el.select(".card-title span").text()
-                thumbnail_url = el.select(".card-thumb img").attr("abs:src")
-            }
-        }
-        val hasNext = doc.select(".pagerx__link[rel=next]").isNotEmpty()
-        return MangasPage(mangas, hasNext)
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url = "$baseUrl/atualizados-recente".toHttpUrl().newBuilder()
+            .addQueryParameter("page", page.toString())
+            .build()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup().extractCsrf()
+        val mangas = document.select(".webtoon-grid a.webtoon-card").map { it.toSManga() }
+        val hasNextPage = document.selectFirst(".pagerx__link[rel=next]") != null
+        return MangasPage(mangas, hasNextPage)
     }
 
-    // =============================== Search ===============================
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        val segments = url.encodedPathSegments.filter(String::isNotBlank)
+        if (url.host != baseUrl.toHttpUrl().host || segments.size != 2 || segments[0] != "comics") return null
+
+        val manga = SManga.create().apply { this.url = "/comics/${segments[1]}" }
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+    }
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         if (query.isNotBlank()) {
-            val url = "$baseUrl/comics".toHttpUrl().newBuilder()
-                .addQueryParameter("src", query)
-                .addQueryParameter("format", "json")
+            if (searchCsrf == null) {
+                client.get(baseUrl, Fetch.DOCUMENT).asJsoup().extractCsrf()
+            }
+            val searchHeaders = headersBuilder()
+                .set("x-csrf-token", searchCsrf.orEmpty())
+                .set("x-requested-with", "XMLHttpRequest")
                 .build()
-            return GET(url, headers)
+            val body = SearchPayload(query).toJsonRequestBody()
+            val response = runCatching {
+                client.post("$baseUrl/comics/search-preview", searchHeaders, Fetch.XHR, body)
+            }.onFailure { searchCsrf = null }.getOrThrow()
+            val mangas = response.parseAs<SearchResponse>().items.map { it.toSManga(baseUrl) }
+            return MangasPage(mangas, false)
         }
 
-        val url = "$baseUrl/comics".toHttpUrl().newBuilder()
-        val status = filters.firstInstanceOrNull<StatusFilter>()?.toUriPart()
-        val genre = filters.firstInstanceOrNull<GenreFilter>()?.toUriPart()
-
-        if (!status.isNullOrEmpty()) url.addQueryParameter("status", status)
-        if (!genre.isNullOrEmpty()) url.addQueryParameter("gen", genre)
-
-        return GET(url.build(), headers)
+        val url = "$baseUrl/comics".toHttpUrl().newBuilder().apply {
+            filters.firstInstanceOrNull<StatusFilter>()?.selected?.let { addQueryParameter("status", it) }
+            filters.firstInstanceOrNull<GenreFilter>()?.selected?.let { addQueryParameter("gen", it) }
+        }.build()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
+        val mangas = document.select(".webtoon-grid a.webtoon-card").map { it.toSManga() }
+        return MangasPage(mangas, false)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = if (response.request.url.queryParameter("format") == "json") {
-        val searchResponse = response.parseAs<SearchResponse>()
-        val mangas = searchResponse.items.map { it.toSManga(baseUrl) }
-        MangasPage(mangas, false)
-    } else {
-        val doc = response.asJsoup()
-        val mangas = doc.select(".webtoon-grid a.webtoon-card").map { el ->
-            SManga.create().apply {
-                setUrlWithoutDomain(el.attr("abs:href"))
-                title = el.select(".card-title span").text()
-                thumbnail_url = el.select(".card-thumb img").attr("abs:src")
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        return SMangaUpdate(
+            parseDetails(document),
+            parseChapters(document),
+        )
+    }
+
+    private fun parseDetails(document: Document) = SManga.create().apply {
+        setUrlWithoutDomain(document.location())
+        title = document.selectFirst(".project-title")!!.text()
+        thumbnail_url = document.selectFirst(".project-cover")?.attrOrNull("abs:src")
+        author = document.selectFirst(".quick-info-item:has(.fa-pen-nib) strong")?.textOrNull()
+        artist = document.selectFirst(".quick-info-item:has(.fa-palette) strong")?.textOrNull()
+        description = MarkdownDescription.Builder()
+            .description(document.selectFirst(".project-description"))
+            .build()
+        genre = document.select(".project-genres .genre-tag")
+            .takeIf { it.isNotEmpty() }
+            ?.joinToString { it.text() }
+        val statusText = document.selectFirst(".status-pill")?.text()?.lowercase().orEmpty()
+        status = when {
+            "lançamento" in statusText -> SManga.ONGOING
+            "completo" in statusText -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+    }
+
+    private fun parseChapters(document: Document): List<SChapter> = document.select("#tab-capitulos-list .normal_ep").map { element ->
+        SChapter.create().apply {
+            val number = element.selectFirst(".num")!!.text()
+            val link = element.selectFirst("a[href]")
+            if (link != null) {
+                setUrlWithoutDomain(link.absUrl("href"))
+            } else {
+                url = document.location().toHttpUrl().newBuilder()
+                    .addPathSegment("ler")
+                    .addPathSegment("capitulo-$number")
+                    .build()
+                    .encodedPath
             }
-        }
-        MangasPage(mangas, false)
-    }
-
-    // =========================== Manga Details ============================
-    override fun mangaDetailsParse(response: Response): SManga {
-        val doc = response.asJsoup()
-        return SManga.create().apply {
-            title = doc.select(".project-title").text()
-            thumbnail_url = doc.select(".project-cover").attr("abs:src")
-            author = doc.select(".quick-info-item:has(.fa-pen-nib) strong").text()
-            artist = doc.select(".quick-info-item:has(.fa-palette) strong").text()
-            description = doc.select(".project-description").text()
-            genre = doc.select(".project-genres .genre-tag").joinToString { it.text() }
-
-            val statusText = doc.select(".status-pill").text().lowercase()
-            status = when {
-                statusText.contains("lançamento") -> SManga.ONGOING
-                statusText.contains("completo") -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
+            val chapterTitle = element.selectFirst(".cell-title strong.line-3")?.textOrNull()
+            name = listOfNotNull("Capítulo $number", chapterTitle).joinToString(" - ")
+            date_upload = DATE_FORMAT.tryParseDate(element.selectFirst(".cell-num .text-muted")?.text())
         }
     }
 
-    // ============================== Chapters ==============================
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val doc = response.asJsoup()
-        val mangaUrl = response.request.url.encodedPath
-
-        return doc.select("#tab-capitulos-list .normal_ep").map { el ->
-            SChapter.create().apply {
-                val linkElement = el.selectFirst("a[href]")
-                val num = el.select(".num").text()
-
-                if (linkElement != null) {
-                    setUrlWithoutDomain(linkElement.attr("abs:href"))
-                } else {
-                    url = "$mangaUrl/ler/capitulo-$num"
-                }
-
-                var chapterName = "Capítulo $num"
-                val title = el.select(".cell-title strong.line-3").text()
-                if (title.isNotEmpty()) {
-                    chapterName += " - $title"
-                }
-                name = chapterName
-
-                date_upload = dateFormat.tryParse(el.select(".cell-num .text-muted").text())
-            }
-        }
-    }
-
-    // =============================== Pages ================================
-    override fun pageListParse(response: Response): List<Page> {
-        val doc = response.asJsoup()
-
-        for (script in doc.select("script:not([src])")) {
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        val document = client.get(chapterUrl, Fetch.DOCUMENT).asJsoup()
+        for (script in document.select("script:not([src])")) {
             val match = PAGE_LIST_REGEX.find(script.html()) ?: continue
             val urls = match.groupValues[1].parseAs<List<String>>()
-            return urls.mapIndexed { i, url ->
-                Page(i, imageUrl = if (url.startsWith("http")) url else "$baseUrl$url")
+            return urls.mapIndexed { index, url ->
+                Page(index, imageUrl = baseUrl.toHttpUrl().resolve(url)!!.toString())
             }
         }
-
-        if (doc.html().contains("showLoginModal()")) {
-            throw Exception(
-                "Necessário fazer login. Abra o site no WebView (ícone de navegador " +
-                    "no canto superior direito), faça login com sua conta e tente novamente.",
-            )
+        if (document.location() != chapterUrl) {
+            error("Log in and link Discord in WebView")
         }
-        throw Exception("Nenhuma página encontrada ou estrutura do site foi alterada.")
+        return emptyList()
     }
 
-    override fun imageRequest(page: Page): Request = super.imageRequest(page).newBuilder()
+    override fun getImageRequest(page: Page): Request = super.getImageRequest(page).newBuilder()
         .removeHeader("Referer")
-        .removeHeader("Upgrade-Insecure-Requests")
-        .removeHeader("Sec-Fetch-Dest")
-        .removeHeader("Sec-Fetch-Mode")
-        .removeHeader("Sec-Fetch-Site")
-        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-        .header("Sec-Fetch-Dest", "image")
-        .header("Sec-Fetch-Mode", "no-cors")
-        .header("Sec-Fetch-Site", "same-origin")
         .build()
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    override val supportsFilterFetching: Boolean get() = true
 
-    // ============================== Filters ===============================
-    override fun getFilterList() = FilterList(
-        StatusFilter(),
-        GenreFilter(),
+    override suspend fun fetchFilterData(): JsonElement {
+        val document = client.get("$baseUrl/comics", Fetch.DOCUMENT).asJsoup()
+        return document.select("li.generos-blackout a[href*='gen=']")
+            .map { it.absUrl("href").toHttpUrl().queryParameter("gen")!! }
+            .toJsonElement()
+    }
+
+    override fun getFilterList(data: JsonElement?) = FilterList(
+        buildList {
+            add(StatusFilter())
+            data?.parseAs<List<String>>()?.let { add(GenreFilter(it)) }
+        },
     )
 
-    // ============================== Utilities =============================
-    private fun ageGateInterceptor(chain: Interceptor.Chain): Response {
-        val original = chain.request()
-        val url = original.url
+    private fun Element.toSManga() = SManga.create().apply {
+        setUrlWithoutDomain(absUrl("href"))
+        title = selectFirst("h2, .card-title")!!.text()
+        thumbnail_url = selectFirst("img")?.attrOrNull("abs:src")
+    }
 
-        if (url.host == baseHttpUrl.host) {
-            val cookies = client.cookieJar.loadForRequest(url)
-            if (cookies.none { it.name == "age_gate_consent" }) {
-                val ageCookie = Cookie.Builder()
-                    .name("age_gate_consent")
-                    .value("{\"consentAt\":1777661090431,\"expiresAt\":1778265890431}")
-                    .domain(url.host)
-                    .path("/")
-                    .build()
-
-                val popCookie = Cookie.Builder()
-                    .name("_popprepop")
-                    .value("1")
-                    .domain(url.host)
-                    .path("/")
-                    .build()
-
-                client.cookieJar.saveFromResponse(url, listOf(ageCookie, popCookie))
-            }
-        }
-        return chain.proceed(original)
+    private fun Document.extractCsrf() = apply {
+        searchCsrf = selectFirst("meta[name=csrf-token]")?.attr("content")
     }
 
     companion object {
-        private val dateFormat = SimpleDateFormat("dd.MM.yy", Locale.ROOT)
-
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("dd.MM.yy", Locale.ROOT)
         private val PAGE_LIST_REGEX = Regex("""S\s*=\s*(\[[\s\S]*?])""")
     }
 }

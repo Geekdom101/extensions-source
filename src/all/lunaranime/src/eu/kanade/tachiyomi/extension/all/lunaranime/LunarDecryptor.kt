@@ -1,156 +1,254 @@
 package eu.kanade.tachiyomi.extension.all.lunaranime
 
 import android.util.Base64
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.util.asJsoup
+import android.webkit.WebResourceResponse
+import keiyoushi.utils.aesCbc
+import keiyoushi.utils.aesDecrypt
+import keiyoushi.utils.array
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.runWebView
+import keiyoushi.utils.sha256
+import keiyoushi.utils.string
+import keiyoushi.utils.stringOrNull
+import keiyoushi.utils.toJsonString
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Response
-import java.security.MessageDigest
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
-import kotlin.experimental.xor
+import okio.Buffer
+import org.jsoup.nodes.Document
+import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.security.GeneralSecurityException
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.random.Random
+import kotlin.time.Clock
+import kotlin.time.Duration.Companion.seconds
 
-class LunarDecryptor(
-    private val client: OkHttpClient,
-    private val apiUrl: String,
-) {
+class LunarDecryptor(private val serenity: LunarSerenity) {
 
-    fun decryptChapterImages(chapterResponse: Response, slug: String, chapterNum: String, lang: String): List<String> {
-        val seedObjs = chapterResponse.extractSeeds()
-        require(seedObjs.size >= 2) { "Failed to find payload seeds" }
+    private val seedMutex = Mutex()
 
-        val rctx0 = generateRctxFrom(seedObjs[0])
-        val rctx1 = generateRctxFrom(seedObjs[1])
+    suspend fun extractSeeds(document: Document, client: OkHttpClient): LunarSeeds {
+        val rows = document.flightRows()
+        val pageUrl = document.location().toHttpUrl()
+        val groups = linkedMapOf<SeedComponent, MutableList<JsonObject>>()
 
-        val token = generateToken(rctx0, rctx1, slug, chapterNum)
-
-        // val response = client.newCall(GET("$apiUrl/api/user/server-region?v=$token")).execute().close()
-
-        val sessionDataB64 = fetchSessionData(token, lang)
-
-        val finalJson = decryptSessionImages(sessionDataB64, rctx0)
-        return finalJson.parseAs<LunarPageListDecrypted>().data.images
-    }
-
-    private fun fetchSessionData(token: String, lang: String): String {
-        val url = "$apiUrl/api/manga/r/$token?lang=$lang"
-        val response = client.newCall(GET(url)).execute()
-        if (!response.isSuccessful) error("Failed decrypting with ${response.code} while fetching session_data")
-        val res = response.parseAs<LunarPageListResponse>()
-        return res.data?.sessionData ?: error("session_data is empty")
-    }
-
-    private val nextFPushRegex = Regex("""self\.__next_f\.push\(\[1,"(.*?)"\]\)""", RegexOption.DOT_MATCHES_ALL)
-    private val dictRegex = Regex("""\{[^{}]*\}""")
-    fun Response.extractSeeds(): List<Map<String, String>> {
-        val doc = asJsoup()
-        val seedObjects = mutableListOf<Map<String, String>>()
-        val scripts = doc.select("script:not([src])")
-        for (script in scripts) {
-            val scriptData = script.data()
-            for (match in nextFPushRegex.findAll(scriptData)) {
-                val segment = match.groupValues[1]
-                val decoded = segment.replace("\\\\", "\\").replace("\\\"", "\"")
-                for (dictStr in dictRegex.findAll(decoded)) {
-                    try {
-                        val map = dictStr.value.parseAs<Map<String, String>>()
-                        if (map.keys.any { it.length == 2 }) {
-                            seedObjects.add(map)
-                        }
-                    } catch (_: Exception) { }
+        rows.forEachIndexed { index, row ->
+            if (row.value.startsWith("[") || row.value.startsWith("{")) {
+                val element = try {
+                    row.value.parseAs<JsonElement>()
+                } catch (_: SerializationException) {
+                    null
+                }
+                element?.forEachSeedElement { reference, props ->
+                    rows.componentAt(reference, index, pageUrl)?.let { groups.getOrPut(it) { mutableListOf() } += props }
                 }
             }
         }
-        return seedObjects
-    }
+        if (groups.isEmpty()) error("Failed to find payload seeds")
 
-    private val b64urlDecode = { s: String ->
-        Base64.decode(s.replace('-', '+').replace('_', '/').padEnd((s.length + 3) / 4 * 4, '='), Base64.DEFAULT)
-    }
+        val seedGroups = groups.entries
+            .sortedByDescending { (_, candidates) -> candidates.sumOf { it.size } }
+            .map { (component, candidates) -> LunarSeedGroup(component.moduleId, component.chunkUrls, candidates) }
+        val script = "(${javaClass.getResource(RUNTIME_ASSET)!!.readText()})(${seedGroups.toJsonString()})"
+        val chunkUrls = groups.keys.flatMap { it.chunkUrls }.toSet()
 
-    private val randAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-
-    // Find 2-char key from flight chunks
-    private fun findTwoCharKey(data: Map<String, String>) = data.entries.first { it.key.length == 2 }.let { it.key to it.value.reversed() }
-
-    // Decode reversed base64
-    private fun decodeReversedBase64(reversed: String) = String(Base64.decode(reversed.padEnd((reversed.length + 3) / 4 * 4, '='), Base64.DEFAULT))
-
-    // Construct rctx0/rctx1 from seed object with some bit rotations
-    private fun generateRctxFrom(seedObj: Map<String, String>): String {
-        val (_, reversedB64) = findTwoCharKey(seedObj)
-        val (xorKey, hexStr) = decodeReversedBase64(reversedB64).split('.')
-            .let { parts -> parts[0].toInt(16) to parts.drop(1).joinToString("") { seedObj[it] ?: "" } }
-
-        val aStr = hexStr.chunked(2).mapIndexed { i, h ->
-            ((h.toInt(16) xor ((xorKey + i * 7 + 3) and 0xFF)).toChar())
-        }.joinToString("")
-        if (aStr.isEmpty()) return ""
-
-        val rand = Random(aStr.length.toLong()) // JS: Math.random() seeded through length
-        val h = IntArray(256) { it }.apply {
-            // shuffle
-            for (i in 255 downTo 1) {
-                val j = rand.nextInt(i + 1)
-                this[i] = this[j].also { this[j] = this[i] }
+        return try {
+            seedMutex.withLock {
+                runWebView<LunarSeeds?>(timeout = 15.seconds) {
+                    interceptRequest { request ->
+                        when {
+                            request.url.host == null -> null
+                            request.url.toString() in chunkUrls -> proxyRequest(request, client)
+                            else -> WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                        }
+                    }
+                    onPageFinished {
+                        evaluateJs(script) { result -> resolve(result.parseAs<LunarSeeds?>()) }
+                    }
+                    loadData(pageUrl.resolve("/")!!.toString(), "")
+                }
             }
-        }
-        val s = IntArray(256) { i -> h.indexOf(i) }
-        val u = IntArray(aStr.length) { rand.nextInt(256) }
-        val d = aStr.map { it.code }.toMutableList()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            throw IOException("Failed to find payload seeds", e)
+        } ?: error("Failed to find payload seeds")
+    }
 
-        repeat(3) { round ->
-            // 3 forward rounds (JS)
-            d.indices.forEach { t ->
-                d[t] = d[t] xor u[(t + 7 * round) % u.size]
-                d[t] = h[d[t]]
-                val shift = (t + 3 * round + 1) % 7 + 1
-                d[t] = ((d[t] shl shift) or (d[t] shr (8 - shift))) and 0xFF
+    private data class SeedComponent(val moduleId: JsonElement, val chunkUrls: List<String>)
+
+    private fun JsonElement.forEachSeedElement(block: (reference: String, props: JsonObject) -> Unit) {
+        when (this) {
+            is JsonArray -> {
+                seedProps()?.let { block(get(1).string.removePrefix("\$L"), it) }
+                forEach { it.forEachSeedElement(block) }
             }
-            for (t in 1 until d.size) d[t] = d[t] xor d[t - 1]
+            is JsonObject -> values.forEach { it.forEachSeedElement(block) }
+            else -> Unit
         }
+    }
 
-        val e = d.toMutableList() // 3 reverse rounds
-        for (round in 2 downTo 0) {
-            for (t in e.size - 1 downTo 1) e[t] = e[t] xor e[t - 1]
-            e.indices.forEach { t ->
-                var shift = (t + 3 * round + 1) % 7 + 1
-                e[t] = ((e[t] shr shift) or (e[t] shl (8 - shift))) and 0xFF
-                e[t] = s[e[t]]
-                e[t] = e[t] xor u[(t + 7 * round) % u.size]
+    private fun JsonArray.seedProps(): JsonObject? {
+        if (size != 4 || (get(0) as? JsonPrimitive)?.stringOrNull != "\$") return null
+        if ((get(1) as? JsonPrimitive)?.stringOrNull?.startsWith("\$L") != true) return null
+        val props = get(3) as? JsonObject ?: return null
+        return props.takeIf { it.isNotEmpty() && it.values.all { value -> value is JsonPrimitive && value.isString } }
+    }
+
+    private class FlightRow(val id: String, val value: String)
+
+    /** The client reference row [id] in effect at row [index]; ids repeat across the page's flight streams. */
+    private fun List<FlightRow>.componentAt(id: String, index: Int, pageUrl: HttpUrl): SeedComponent? {
+        val (rowIndex, row) = rowBefore(id, index) ?: return null
+        if (!row.startsWith("I[")) return null
+        val reference = row.substring(1).parseAs<JsonArray>()
+        val chunkUrls = reference[1].array.map { chunk ->
+            val path = chunk.string.takeUnless { it.startsWith("\$") }
+                ?: rowBefore(chunk.string.substring(1), rowIndex)?.second?.parseAs<String>()
+                ?: return null
+            pageUrl.resolve(path)!!.toString()
+        }
+        return SeedComponent(reference[0], chunkUrls)
+    }
+
+    private fun List<FlightRow>.rowBefore(id: String, index: Int): Pair<Int, String>? {
+        for (i in index - 1 downTo 0) {
+            if (this[i].id == id) return i to this[i].value
+        }
+        return null
+    }
+
+    private fun Document.flightRows(): List<FlightRow> {
+        val buffer = Buffer()
+        select("script:not([src])")
+            .map { it.data().trim() }
+            .filter { it.startsWith(FLIGHT_PUSH) }
+            .map { it.removePrefix(FLIGHT_PUSH).removeSuffix(";").removeSuffix(")").parseAs<JsonArray>() }
+            .forEach { push ->
+                when (push.getOrNull(0)?.stringOrNull) {
+                    "1" -> buffer.writeUtf8(push[1].string)
+                    "3" -> buffer.write(Base64.decode(push[1].string, Base64.DEFAULT))
+                }
             }
+
+        val rows = mutableListOf<FlightRow>()
+        while (!buffer.exhausted()) {
+            if (buffer[0] == NEWLINE) {
+                buffer.skip(1)
+                continue
+            }
+            val colon = buffer.indexOf(COLON)
+            if (colon < 0) break
+            val id = buffer.readUtf8(colon)
+            buffer.skip(1)
+            val value = if (!buffer.exhausted() && buffer[0] == TEXT_ROW) {
+                buffer.skip(1)
+                val length = buffer.readUtf8(buffer.indexOf(COMMA)).toLong(16)
+                buffer.skip(1)
+                buffer.readUtf8(length)
+            } else {
+                val end = buffer.indexOf(NEWLINE)
+                if (end < 0) buffer.readUtf8() else buffer.readUtf8(end)
+            }
+            rows += FlightRow(id, value)
         }
-        return e.joinToString("") { it.toChar().toString() }
+        return rows
     }
 
-    // Js: char code XOR
-    private infix fun String.xor(other: String) = ByteArray(maxOf(length, other.length)) { i ->
-        (this[i % length].code.toByte() xor other[i % other.length].code.toByte())
+    fun newNonce(): String = randomString(NONCE_LENGTH)
+
+    /**
+     * `mint()` in the site's bundle: a timestamped payload naming the chapter, stream-encrypted
+     * with a key blended from both seeds. [unpack] takes the same nonce.
+     */
+    fun mint(seeds: LunarSeeds, slug: String, chapter: String, nonce: String): String {
+        val key = blend(seeds.axis, seeds.pitch)
+        require(key.isNotEmpty()) { "Failed to derive chapter key" }
+
+        val timestamp = Clock.System.now().epochSeconds.toString(16)
+        val payload = "$timestamp|$nonce|$slug|$chapter|${randomString(6)}"
+
+        val offset = Random.nextInt(256)
+        val out = ArrayList<Int>(payload.length + 1)
+        out.add(offset)
+        payload.forEachIndexed { i, char ->
+            out.add(char.code xor key[(i + offset) % key.size] xor (offset + seeds.names.mintStep * i and 0xFF) and 0xFF)
+        }
+
+        return out.toByteArray().base64Url()
     }
 
-    // taken from Js: timestamp|rand|slug|chapterNumber→ base64url
-    private fun generateToken(rctx0: String, rctx1: String, slug: String, index: String): String {
-        val xorKey = rctx0 xor rctx1
-        val timestamp = (System.currentTimeMillis() / 1000).toString(16)
-        val rand = (1..8).map { randAlphabet[Random.nextInt(randAlphabet.length)] }.joinToString("")
-        val payload = "$timestamp|$rand|$slug|$index"
-        val encrypted = payload.mapIndexed { i, c ->
-            (c.code xor xorKey[i % xorKey.size].toInt()).toByte()
-        }.toByteArray()
-        return Base64.encodeToString(encrypted, Base64.NO_WRAP)
-            .replace('+', '-').replace('/', '_').trimEnd('=')
-    }
+    private fun blend(axis: String, pitch: String): IntArray {
+        val digest = (axis + SEPARATOR + pitch).sha256()
+        val size = maxOf(axis.length, pitch.length)
 
-    // Decrypt session_data (AES‑CBC) as originally, with key being SHA‑256 of rctx0 from token step
-    private fun decryptSessionImages(sessionDataB64: String, rctx0: String): String {
-        val ciphertext = b64urlDecode(sessionDataB64)
-        val key = MessageDigest.getInstance("SHA-256").digest(rctx0.toByteArray())
-        Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-            init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(ByteArray(16)))
-            return String(doFinal(ciphertext), Charsets.UTF_8)
+        return IntArray(size) { i ->
+            axis[i % axis.length].code xor
+                pitch[i % pitch.length].code xor
+                (digest[i % 32].toInt() and 0xFF) xor
+                (83 * i + 29 and 0xFF) and 0xFF
         }
     }
+
+    /**
+     * The response body is AES-CBC over a key derived from the first seed, the nonce that was
+     * minted into the token, and - when the server enforces it - the Serenity key thumbprint.
+     */
+    fun unpack(sessionData: String, seeds: LunarSeeds, nonce: String): JsonObject {
+        val ciphertext = Base64.decode(
+            sessionData.replace('-', '+').replace('_', '/'),
+            Base64.DEFAULT,
+        )
+        val base = seeds.axis + SEPARATOR + nonce
+
+        for (material in listOf(base + THUMBPRINT_SEPARATOR + serenity.thumbprint, base)) {
+            val plaintext = try {
+                ciphertext.aesDecrypt(aesCbc(material.sha256(), ByteArray(16))).decodeToString()
+            } catch (_: GeneralSecurityException) {
+                continue
+            }
+
+            if (plaintext.startsWith("{")) return plaintext.parseAs<JsonObject>().renamed(seeds.names.inner)
+        }
+        error("Failed to decrypt chapter session data")
+    }
+
+    private fun randomString(length: Int) = String(CharArray(length) { ALPHABET[Random.nextInt(ALPHABET.length)] })
+
+    private fun List<Int>.toByteArray() = ByteArray(size) { this[it].toByte() }
+
+    private fun ByteArray.base64Url(): String = Base64.encodeToString(this, Base64.NO_WRAP or Base64.NO_PADDING or Base64.URL_SAFE)
+
+    companion object {
+        private const val ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        private const val NONCE_LENGTH = 12
+        private const val SEPARATOR = "\u0001"
+        private const val THUMBPRINT_SEPARATOR = "\u0002"
+        private const val RUNTIME_ASSET = "/assets/lunar-seed-runtime.js"
+        private const val FLIGHT_PUSH = "self.__next_f.push("
+        private const val NEWLINE = '\n'.code.toByte()
+        private const val COLON = ':'.code.toByte()
+        private const val COMMA = ','.code.toByte()
+        private const val TEXT_ROW = 'T'.code.toByte()
+    }
+}
+
+internal fun JsonObject.renamed(pairs: List<List<String>>): JsonObject {
+    fun JsonObject.rename(): JsonObject {
+        val map = toMutableMap()
+        pairs.forEach { (from, to) -> map.remove(from)?.let { map[to] = it } }
+        return JsonObject(map)
+    }
+
+    val outer = rename().toMutableMap()
+    (outer["data"] as? JsonObject)?.let { outer["data"] = it.rename() }
+    return JsonObject(outer)
 }

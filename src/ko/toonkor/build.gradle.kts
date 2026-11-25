@@ -6,14 +6,21 @@ plugins {
 
 keiyoushi {
     name = "Toonkor"
-    versionCode = 7
+    versionCode = 14
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
+
+    deeplink {
+        path("/..*")
+    }
 
     source {
         lang = "ko"
         baseUrl {
-            custom("https://tkor131.com")
+            mirrors(
+                "툰코" to "https://009.toonkor.net",
+                "펀비" to "https://009.funbe.org",
+            )
         }
     }
 }

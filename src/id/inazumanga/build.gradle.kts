@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "ReYume"
-    versionCode = 29
+    versionCode = 30
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "zeistmanga"
 
     source {

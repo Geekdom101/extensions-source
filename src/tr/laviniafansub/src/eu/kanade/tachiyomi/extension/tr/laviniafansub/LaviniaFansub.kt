@@ -3,21 +3,27 @@ package eu.kanade.tachiyomi.extension.tr.laviniafansub
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import okhttp3.OkHttpClient
 import org.jsoup.nodes.Document
-import java.text.SimpleDateFormat
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
 abstract class LaviniaFansub : Madara() {
-    override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
-    override val useLoadMoreRequest = LoadMoreStrategy.Always
-
-    override val useNewChapterEndpoint = true
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ROOT)
+    override val chapterMode = ChapterMode.MangaAjax
 
     override val chapterUrlSelector = "a:not(:has(img))"
 
-    override fun pageListParse(document: Document): List<Page> {
-        val pageList = super.pageListParse(document)
+    // Each old domain redirects to the next one
+    override suspend fun fetchBaseUrls(client: OkHttpClient): List<String> = listOf(
+        client.get(baseUrl, Fetch.DOCUMENT).use { it.request.url.toString() },
+    )
+
+    override fun parsePages(document: Document): List<Page> {
+        val pageList = super.parsePages(document)
 
         if (
             pageList.isEmpty() &&

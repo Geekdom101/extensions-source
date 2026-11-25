@@ -7,12 +7,11 @@ import org.jsoup.nodes.Document
 @Source
 abstract class ComicVerse : ZeistManga() {
 
-    override fun getChapterFeedUrl(doc: Document): String {
-        val widget = doc.selectFirst("div.manga-widget[data-label]")
-            ?: throw Exception("Failed to find chapter feed")
+    override val popularMangaSelector = "div.PopularPosts figure"
 
-        return apiUrl(chapterCategory)
-            .addPathSegment(widget.attr("data-label"))
-            .build().toString()
-    }
+    override val mangaDetailsSelectorGenres = ".cv-genres-above-story > a[rel=tag]"
+
+    override fun getChapterFeedUrl(doc: Document, mangaTitle: String) = super.getChapterFeedUrl(doc, doc.selectFirst("[data-label]")!!.attr("data-label"))
+
+    override val pageListSelector = "#cvOriginal"
 }

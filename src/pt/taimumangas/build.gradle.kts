@@ -8,7 +8,7 @@ keiyoushi {
     name = "TaimuMangas"
     versionCode = 2
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         name = "Taimu Mangas"

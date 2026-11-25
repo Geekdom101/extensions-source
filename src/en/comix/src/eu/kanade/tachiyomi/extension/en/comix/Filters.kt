@@ -135,7 +135,8 @@ class Filters(
         Filter.Separator(),
         DemographicFilter(getDemographics(), selectedDemographics),
         StatusFilter(),
-        MinChapterFilter(),
+        ChapterLengthFilter("Minimum Chapter Length", "min_chap"),
+        ChapterLengthFilter("Maximum Chapter Length", "max_chap"),
         Filter.Separator(),
         Filter.Header("Release Year"),
         YearFromFilter(),
@@ -158,7 +159,9 @@ class Filters(
     ),
         UriFilter {
         override fun addToUri(builder: HttpUrl.Builder) {
-            builder.addQueryParameter(param, vals[state].second)
+            vals[state].second.takeIf { it.isNotEmpty() }?.let {
+                builder.addQueryParameter(param, it)
+            }
         }
     }
 
@@ -167,8 +170,9 @@ class Filters(
     private open class UriMultiSelectFilter(
         name: String,
         private val param: String,
-        vals: Array<Pair<String, String>>,
-        selectedValues: Set<String> = emptySet(),
+        private val vals: Array<Pair<String, String>>,
+        private val selectedValues: Set<String> = emptySet(),
+        private val onlyIfSome: Boolean = false,
     ) : Filter.Group<UriMultiSelectOption>(
         name,
         vals.map { (name, value) ->
@@ -178,6 +182,9 @@ class Filters(
         UriFilter {
         override fun addToUri(builder: HttpUrl.Builder) {
             val checked = state.filter { it.state }
+            // Ignore when no explicit inclusion (default)
+            if (onlyIfSome && checked.size == vals.size) return
+
             checked.forEach {
                 builder.addQueryParameter(param, it.value)
             }
@@ -186,24 +193,34 @@ class Filters(
 
     private open class UriTriSelectOption(name: String, val value: String) : Filter.TriState(name)
 
-    // The API ignores demographic exclusions, so this must remain include/off.
+    // Demographics are genre terms on the site
     private class DemographicFilter(
         demographics: Array<Pair<String, String>>,
         selectedValues: Set<String>,
-    ) : UriMultiSelectFilter(
+    ) : Filter.Group<UriTriSelectOption>(
         "Demographic",
-        "demographics[]",
-        demographics,
-        selectedValues,
+        demographics.map { (name, value) ->
+            UriTriSelectOption(name, value).apply {
+                if (value !in selectedValues) state = TriState.STATE_EXCLUDE
+            }
+        },
     ),
-        PreferenceFilter
+        PreferenceFilter {
+        override fun addToUri(builder: HttpUrl.Builder) {
+            state.filter { it.state == TriState.STATE_INCLUDE }
+                .forEach { builder.addQueryParameter("demos", it.value) }
+            state.filter { it.state == TriState.STATE_EXCLUDE }
+                .forEach { builder.addQueryParameter("genres_ex", it.value) }
+        }
+    }
 
     private class TypeFilter(selectedValues: Set<String>) :
         UriMultiSelectFilter(
             "Type",
-            "types[]",
+            "types",
             getTypes(),
             selectedValues,
+            true,
         ),
         PreferenceFilter
 
@@ -226,9 +243,9 @@ class Filters(
 
         override fun addToUri(builder: HttpUrl.Builder) {
             state.filter { it.state == TriState.STATE_INCLUDE }
-                .forEach { builder.addQueryParameter("genres_in[]", it.value) }
+                .forEach { builder.addQueryParameter("genres_in", it.value) }
             state.filter { it.state == TriState.STATE_EXCLUDE }
-                .forEach { builder.addQueryParameter("genres_ex[]", it.value) }
+                .forEach { builder.addQueryParameter("genres_ex", it.value) }
         }
     }
 
@@ -245,7 +262,7 @@ class Filters(
     private class StatusFilter :
         UriMultiSelectFilter(
             "Status",
-            "statuses[]",
+            "statuses",
             arrayOf(
                 Pair("Releasing", "releasing"),
                 Pair("Finished", "finished"),
@@ -298,23 +315,24 @@ class Filters(
             defaultValue,
         ),
         PreferenceFilter {
+        // The site reads one comma-separated content_rating
         override fun addToUri(builder: HttpUrl.Builder) {
-            Filters.getContentRatingsUpTo(CONTENT_RATING_OPTIONS[state].second)
-                .takeIf { it.isNotEmpty() }
-                ?.let { builder.addQueryParameter("content_rating", it.joinToString(",")) }
+            val ratings = getContentRatingsUpTo(CONTENT_RATING_OPTIONS[state].second)
+                .ifEmpty { getContentRatingsUpTo("pornographic") }
+            builder.addQueryParameter("content_rating", ratings.joinToString(","))
         }
     }
 
-    private class MinChapterFilter :
-        Filter.Text("Minimum Chapter Length"),
+    private class ChapterLengthFilter(name: String, private val param: String) :
+        Filter.Text(name),
         UriFilter {
         override fun addToUri(builder: HttpUrl.Builder) {
             if (state.isNotEmpty()) {
                 val value = state.toIntOrNull()?.takeIf { it > 0 }
                     ?: throw IllegalArgumentException(
-                        "Minimum chapter length must be a positive integer greater than 0",
+                        "$name must be a positive integer greater than 0",
                     )
-                builder.addQueryParameter("min_chap", value.toString())
+                builder.addQueryParameter(param, value.toString())
             }
         }
     }
@@ -357,11 +375,8 @@ class Filters(
                     selected
                 }
                 val value = if (state!!.ascending) "asc" else "desc"
-                if (order == "relevance") {
-                    builder.addQueryParameter("sort", "relevance:$value")
-                } else {
-                    builder.addQueryParameter("order[$order]", value)
-                }
+
+                builder.addQueryParameter("sort", "$order:$value")
             }
         }
     }

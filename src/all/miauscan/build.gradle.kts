@@ -6,15 +6,15 @@ plugins {
 
 keiyoushi {
     name = "Miau Scan"
-    versionCode = 7
+    versionCode = 8
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "mangathemesia"
 
     listOf("es", "pt-BR").forEach { sourceLang ->
         source {
             lang = sourceLang
-            baseUrl = "https://leemiau.com"
+            baseUrl = "https://leer.lectovela.com"
         }
     }
 }

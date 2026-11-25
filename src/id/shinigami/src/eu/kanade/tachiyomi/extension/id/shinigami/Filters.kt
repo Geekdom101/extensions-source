@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.id.shinigami
 
 import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.source.model.Filter.Sort.Selection
 import okhttp3.HttpUrl
 
 interface UriFilter {
@@ -45,55 +46,21 @@ open class UriMultiSelectFilter(
     }
 }
 
-open class UriMultiTriSelectOption(name: String, val value: String) : Filter.TriState(name)
-
-open class UriMultiTriSelectFilter(
-    name: String,
-    private val includeParam: String,
-    private val excludeParam: String,
-    private val options: Array<Pair<String, String>>,
-) : Filter.Group<UriMultiTriSelectOption>(
-    name,
-    options.map { UriMultiTriSelectOption(it.first, it.second) },
-),
-    UriFilter {
-    override fun addToUri(builder: HttpUrl.Builder) {
-        val included = state.filter { it.isIncluded() }.map { it.value }
-        val excluded = state.filter { it.isExcluded() }.map { it.value }
-
-        if (included.isNotEmpty()) {
-            builder.addQueryParameter(includeParam, included.joinToString(","))
-            builder.addQueryParameter("genre_include_mode", "and")
-        }
-        if (excluded.isNotEmpty()) {
-            builder.addQueryParameter(excludeParam, excluded.joinToString(","))
-            builder.addQueryParameter("genre_exclude_mode", "and")
-        }
-    }
-}
-
-class SortFilter(default: String = "") :
-    UriPartFilter(
+class SortFilter :
+    Filter.Sort(
         "Sort",
-        "sort",
-        arrayOf(
-            Pair("Default", ""),
-            Pair("Latest", "latest"),
-            Pair("Popularity", "popularity"),
-            Pair("Rating", "rating"),
-        ),
-        default,
-    )
-
-class SortOrderFilter :
-    UriPartFilter(
-        "Sort Order",
-        "sort_order",
-        arrayOf(
-            Pair("Descending", "desc"),
-            Pair("Ascending", "asc"),
-        ),
-    )
+        arrayOf("Latest Updates", "New Series", "Popularity", "Rating", "A-Z"),
+        Selection(0, false),
+    ) {
+    val sort get() = when (state?.index) {
+        1 -> "new_manga"
+        2 -> "popularity"
+        3 -> "rating"
+        4 -> "title"
+        else -> "latest"
+    }
+    val order get() = if (state?.index == 4 || state?.ascending == true) "asc" else "desc"
+}
 
 class StatusFilter :
     UriPartFilter(
@@ -128,10 +95,31 @@ class TypeFilter :
         ),
     )
 
-class GenreFilter(genres: Array<Pair<String, String>>) :
-    UriMultiTriSelectFilter(
-        "Genre",
-        "genre_include",
-        "genre_exclude",
-        genres,
+class GenreFilter(options: Array<Pair<String, String>>) : UriMultiSelectFilter("Genre", "genre", options)
+
+class ThemeFilter(options: Array<Pair<String, String>>) : UriMultiSelectFilter("Theme", "theme", options)
+
+class SubFormatFilter :
+    UriMultiSelectFilter(
+        "Sub-format",
+        "subformat",
+        arrayOf(
+            Pair("Long Strip", "long-strip"),
+            Pair("Web Comic", "web-comic"),
+            Pair("Adaptation", "adaptation-2"),
+            Pair("Full Color", "full-color"),
+        ),
+    )
+
+class ChapterRangeFilter :
+    UriPartFilter(
+        "Chapters",
+        "min_chapters",
+        arrayOf(
+            Pair("All", ""),
+            Pair("10+", "10"),
+            Pair("50+", "50"),
+            Pair("100+", "100"),
+            Pair("200+", "200"),
+        ),
     )

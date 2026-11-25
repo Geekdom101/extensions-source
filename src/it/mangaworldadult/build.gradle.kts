@@ -6,13 +6,13 @@ plugins {
 
 keiyoushi {
     name = "MangaworldAdult"
-    versionCode = 1
+    versionCode = 0
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "mangaworld"
 
     source {
         lang = "it"
-        baseUrl = "https://www.mangaworldadult.net"
+        baseUrl = "https://www.mangaworldadult.org"
     }
 }

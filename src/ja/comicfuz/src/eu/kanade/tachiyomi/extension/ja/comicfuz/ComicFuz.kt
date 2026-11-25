@@ -1,72 +1,42 @@
 package eu.kanade.tachiyomi.extension.ja.comicfuz
 
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
-import kotlinx.serialization.decodeFromByteArray
-import kotlinx.serialization.encodeToByteArray
-import kotlinx.serialization.protobuf.ProtoBuf
+import keiyoushi.network.Fetch
+import keiyoushi.network.post
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.firstInstance
+import keiyoushi.utils.parseAsProto
+import keiyoushi.utils.toRequestBodyProto
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import okio.IOException
+import okhttp3.OkHttpClient
 
 @Source
-abstract class ComicFuz : HttpSource() {
-    private val domain = baseUrl.toHttpUrl().host
-    private val apiUrl = "https://api.$domain/v1"
-    private val cdnUrl = "https://img.$domain"
+abstract class ComicFuz : KeiSource() {
+    private val domain get() = baseUrl.toHttpUrl().host
+    private val apiUrl get() = "https://api.$domain/v1"
+    private val cdnUrl get() = "https://img.$domain"
 
-    override val supportsLatest = true
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor(ImageInterceptor)
 
-    override val client = network.client.newBuilder()
-        .addInterceptor(ImageInterceptor)
-        .addNetworkInterceptor { chain ->
-            val response = chain.proceed(chain.request())
+    override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", getFilterList())
 
-            if (!response.isSuccessful) {
-                val exception = when (response.code) {
-                    401 -> "Unauthorized"
-                    402 -> "Payment Required"
-                    else -> "HTTP error ${response.code}"
-                }
-
-                throw IOException(exception)
-            }
-
-            return@addNetworkInterceptor response
-        }
-        .build()
-
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-
-    override fun popularMangaRequest(page: Int): Request = searchMangaRequest(page, "", getFilterList())
-
-    override fun popularMangaParse(response: Response): MangasPage = searchMangaParse(response)
-
-    override fun latestUpdatesRequest(page: Int): Request {
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
         val payload = DayOfWeekRequest(
             deviceInfo = DeviceInfo(
                 deviceType = DeviceType.BROWSER,
             ),
             dayOfWeek = DayOfWeek.today(),
-        ).toRequestBody()
+        ).toRequestBodyProto()
 
-        return POST("$apiUrl/mangas_by_day_of_week", headers, payload)
-    }
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val data = response.parseAs<MangaListResponse>()
+        val data = client.post("$apiUrl/mangas_by_day_of_week", Fetch.XHR, payload).parseAsProto<MangaListResponse>()
         val entries = data.mangas.map {
             it.toSManga(cdnUrl)
         }
@@ -74,8 +44,8 @@ abstract class ComicFuz : HttpSource() {
         return MangasPage(entries, false)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val tag = filters.filterIsInstance<TagFilter>().first()
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val tag = filters.firstInstance<TagFilter>()
 
         return if (query.isNotBlank() || tag.selected == null) {
             val payload = SearchRequest(
@@ -85,76 +55,70 @@ abstract class ComicFuz : HttpSource() {
                 query = query.trim(),
                 pageIndexOfMangas = page,
                 pageIndexOfBooks = 1,
-            ).toRequestBody()
+            ).toRequestBodyProto()
 
-            POST("$apiUrl/search#$page", headers, payload)
-        } else {
-            val payload = MangaListRequest(
-                deviceInfo = DeviceInfo(
-                    deviceType = DeviceType.BROWSER,
-                ),
-                tagId = tag.selected!!,
-            ).toRequestBody()
-
-            POST("$apiUrl/manga_list", headers, payload)
-        }
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        return if (response.request.url.pathSegments.last() == "search") {
-            val data = response.parseAs<SearchResponse>()
-            val page = response.request.url.fragment!!.toInt()
+            val data = client.post("$apiUrl/search", Fetch.XHR, payload).parseAsProto<SearchResponse>()
             val entries = data.mangas.map {
                 it.toSManga(cdnUrl)
             }
 
             MangasPage(entries, data.pageCountOfMangas > page)
         } else {
-            val data = response.parseAs<MangaListResponse>()
+            val payload = MangaListRequest(
+                deviceInfo = DeviceInfo(
+                    deviceType = DeviceType.BROWSER,
+                ),
+                tagId = tag.selected!!,
+            ).toRequestBodyProto()
+
+            val data = client.post("$apiUrl/manga_list", Fetch.XHR, payload).parseAsProto<MangaListResponse>()
             val entries = data.mangas.map {
                 it.toSManga(cdnUrl)
             }
 
-            return MangasPage(entries, false)
+            MangasPage(entries, false)
         }
     }
 
-    override fun getFilterList() = getFilters()
+    override fun getFilterList(data: JsonElement?) = getFilters()
 
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        val payload = MangaDetailsRequest(
-            deviceInfo = DeviceInfo(
-                deviceType = DeviceType.BROWSER,
-            ),
-            mangaId = manga.url.substringAfterLast("/").toInt(),
-        ).toRequestBody()
-
-        return POST("$apiUrl/manga_detail", headers, payload)
-    }
-
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url}"
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val data = response.parseAs<MangaDetailsResponse>()
-
-        return data.toSManga(cdnUrl)
-    }
-
-    override fun chapterListRequest(manga: SManga) = mangaDetailsRequest(manga)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val data = response.parseAs<MangaDetailsResponse>()
-
-        return data.chapterGroups.flatMap { group ->
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val data = getMangaDetails(manga.url.substringAfterLast("/").toInt())
+        val chapterList = data.chapterGroups.flatMap { group ->
             group.chapters.map { chapter ->
                 chapter.toSChapter()
             }
         }
+
+        return SMangaUpdate(data.toSManga(cdnUrl), chapterList)
     }
 
-    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != domain) return null
+        val segments = url.pathSegments
+        if (segments.size != 2 || segments[0] != "manga") return null
+        val id = segments[1].toIntOrNull() ?: return null
 
-    override fun pageListRequest(chapter: SChapter): Request {
+        return getMangaDetails(id).toSManga(cdnUrl).apply { initialized = true }
+    }
+
+    private suspend fun getMangaDetails(mangaId: Int): MangaDetailsResponse {
+        val payload = MangaDetailsRequest(
+            deviceInfo = DeviceInfo(
+                deviceType = DeviceType.BROWSER,
+            ),
+            mangaId = mangaId,
+        ).toRequestBodyProto()
+
+        return client.post("$apiUrl/manga_detail", Fetch.XHR, payload).parseAsProto<MangaDetailsResponse>()
+    }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val payload = MangaViewerRequest(
             deviceInfo = DeviceInfo(
                 deviceType = DeviceType.BROWSER,
@@ -168,37 +132,23 @@ abstract class ComicFuz : HttpSource() {
             viewerMode = ViewerMode(
                 imageQuality = ImageQuality.HIGH,
             ),
-        ).toRequestBody()
+        ).toRequestBodyProto()
 
-        return POST("$apiUrl/manga_viewer", headers, payload)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val data = response.parseAs<MangaViewerResponse>()
+        val data = client.post("$apiUrl/manga_viewer", Fetch.XHR, payload).parseAsProto<MangaViewerResponse>()
 
         val pages = data.pages
             .filter { it.image?.isExtraPage == false }
             .mapNotNull { it.image }
 
         return pages.mapIndexed { idx, page ->
-            Page(
-                index = idx,
-                imageUrl = if (page.encryptionKey.isEmpty() && page.iv.isEmpty()) {
-                    cdnUrl + page.imageUrl
-                } else {
-                    "$cdnUrl${page.imageUrl}".toHttpUrl().newBuilder()
-                        .addQueryParameter("key", page.encryptionKey)
-                        .addQueryParameter("iv", page.iv)
-                        .toString()
-                },
-            )
+            val imageUrl = "$cdnUrl${page.imageUrl}".toHttpUrl().newBuilder().apply {
+                if (page.encryptionKey.isNotEmpty() || page.iv.isNotEmpty()) {
+                    addQueryParameter("key", page.encryptionKey)
+                    addQueryParameter("iv", page.iv)
+                }
+            }.toString()
+
+            Page(index = idx, imageUrl = imageUrl)
         }
     }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    private inline fun <reified T> Response.parseAs(): T = ProtoBuf.decodeFromByteArray(body.bytes())
-
-    private inline fun <reified T : Any> T.toRequestBody(): RequestBody = ProtoBuf.encodeToByteArray(this)
-        .toRequestBody("application/protobuf".toMediaType())
 }

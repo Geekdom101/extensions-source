@@ -1,10 +1,13 @@
 package eu.kanade.tachiyomi.extension.id.inazumanga
 
+import eu.kanade.tachiyomi.multisrc.zeistmanga.Genre
+import eu.kanade.tachiyomi.multisrc.zeistmanga.Status
+import eu.kanade.tachiyomi.multisrc.zeistmanga.Type
 import eu.kanade.tachiyomi.multisrc.zeistmanga.ZeistManga
 import eu.kanade.tachiyomi.source.model.Page
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
-import okhttp3.Response
+import keiyoushi.utils.asJsoup
+import org.jsoup.nodes.Document
 
 @Source
 abstract class ReYume : ZeistManga() {
@@ -25,13 +28,35 @@ abstract class ReYume : ZeistManga() {
     override val mangaDetailsSelectorInfoDescription = "dd"
 
     override val pageListSelector = ".separator"
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
+    override fun pageListParse(document: Document): List<Page> {
         val textArea = document.selectFirst("textarea#zeist-raw-data")?.text().orEmpty()
-
-        val images = response.asJsoup(textArea).select(pageListSelector)
-        return images.select("img[src]").mapIndexed { i, img ->
-            Page(i, "", img.attr("abs:src"))
-        }
+        return super.pageListParse(textArea.asJsoup(baseUrl))
     }
+
+    override val hasFilters = true
+    override val hasLanguageFilter = false
+
+    override fun getStatusList() = listOf(
+        Status("Semua", ""),
+        Status("Ongoing", "Ongoing"),
+        Status("Completed", "Completed"),
+        Status("Dropped", "Dropped"),
+    )
+
+    override fun getTypeList() = listOf(
+        Type("Semua", ""),
+        Type("Manga", "Manga"),
+        Type("Manhua", "Manhua"),
+    )
+
+    override fun getGenreList() = listOf(
+        "Action", "Adventure", "Aliens", "Animals", "Comedy", "Cooking",
+        "Crime", "Demons", "Drama", "Ecchi", "Fantasy", "Game",
+        "Gender Bender", "Ghosts", "Gore", "Harem", "Historical", "Horror",
+        "Isekai", "Josei", "Magic", "Martial Arts", "Mature", "Military",
+        "Monsters", "Music", "Mystery", "Psychological", "Reincarnation", "Romance",
+        "School Life", "Sci-Fi", "Seinen", "Shoujo", "Shounen", "Slice of Life",
+        "Sports", "Supernatural", "Survival", "Thriller", "Tragedy", "Vampire",
+        "Yuri",
+    ).map { Genre(it, it) }
 }

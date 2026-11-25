@@ -6,14 +6,15 @@ plugins {
 
 keiyoushi {
     name = "LuotTruyen"
-    versionCode = 11
+    versionCode = 4
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
+    theme = "wpcomics"
 
     source {
         lang = "vi"
         baseUrl {
-            custom("https://luottruyen16.com")
+            custom("https://luottruyen999.com")
         }
     }
 

@@ -6,10 +6,10 @@ plugins {
 
 keiyoushi {
     name = "Manhwa Indo"
-    versionCode = 11
+    versionCode = 13
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
-    theme = "mangathemesia"
+    libVersion = "1.6"
+    theme = "manhwaindo"
 
     source {
         lang = "id"

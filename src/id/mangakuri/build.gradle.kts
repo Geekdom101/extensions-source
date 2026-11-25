@@ -5,14 +5,15 @@ plugins {
 }
 
 keiyoushi {
-    name = "Mangakuri"
-    versionCode = 34
+    name = "Mushinook"
+    versionCode = 36
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
+    theme = "loneseal"
 
     source {
         lang = "id"
-        baseUrl = "https://lc2.mangakuri.online"
-        versionId = 2
+        baseUrl = "https://mushinook.org"
+        id = 8634079728231059906L
     }
 }

@@ -1,36 +1,34 @@
 package eu.kanade.tachiyomi.extension.ru.mangachan
 
 import eu.kanade.tachiyomi.multisrc.multichan.MultiChan
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import keiyoushi.annotation.Source
 import keiyoushi.utils.firstInstanceOrNull
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
 
 @Source
 abstract class MangaChan : MultiChan() {
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val pageNum = page.coerceAtLeast(1)
+    override val siteDomains = listOf("manga-chan.me")
+
+    override fun searchMangaUrl(page: Int, query: String, filters: FilterList): String {
         if (query.isNotEmpty()) {
             val url = baseUrl.toHttpUrl().newBuilder()
                 .addQueryParameter("do", "search")
                 .addQueryParameter("subaction", "search")
                 .addQueryParameter("story", query)
-                .addQueryParameter("search_start", pageNum.toString())
+                .addQueryParameter("search_start", page.toString())
                 .build()
                 .toString()
-            return GET(url, headers)
+            return url
         }
 
         var genres = ""
         var statusParam = true
         var status = ""
 
-        val filterList = filters.ifEmpty { getFilterList() }
-
-        filterList.forEach { filter ->
+        filters.forEach { filter ->
             when (filter) {
                 is GenreList -> {
                     filter.state.forEach { f ->
@@ -49,7 +47,7 @@ abstract class MangaChan : MultiChan() {
             }
         }
 
-        val orderBy = filterList.firstInstanceOrNull<OrderBy>()
+        val orderBy = filters.firstInstanceOrNull<OrderBy>()
         val url = if (genres.isNotEmpty()) {
             val order = orderBy?.let {
                 if (it.state!!.ascending) {
@@ -60,9 +58,9 @@ abstract class MangaChan : MultiChan() {
             } ?: ""
 
             if (statusParam) {
-                "$baseUrl/tags/${genres.dropLast(1)}$order?offset=${20 * (pageNum - 1)}&status=$status"
+                "$baseUrl/tags/${genres.dropLast(1)}$order?offset=${20 * (page - 1)}&status=$status"
             } else {
-                "$baseUrl/tags/$status/${genres.dropLast(1)}/$order?offset=${20 * (pageNum - 1)}"
+                "$baseUrl/tags/$status/${genres.dropLast(1)}/$order?offset=${20 * (page - 1)}"
             }
         } else {
             val order = orderBy?.let {
@@ -74,16 +72,16 @@ abstract class MangaChan : MultiChan() {
             } ?: "manga/new"
 
             if (statusParam) {
-                "$baseUrl/$order?offset=${20 * (pageNum - 1)}&status=$status"
+                "$baseUrl/$order?offset=${20 * (page - 1)}&status=$status"
             } else {
-                "$baseUrl/$order/$status?offset=${20 * (pageNum - 1)}"
+                "$baseUrl/$order/$status?offset=${20 * (page - 1)}"
             }
         }
 
-        return GET(url, headers)
+        return url
     }
 
-    override fun getFilterList() = FilterList(
+    override fun getFilterList(data: JsonElement?) = FilterList(
         Status(),
         OrderBy(),
         GenreList(getGenreList()),

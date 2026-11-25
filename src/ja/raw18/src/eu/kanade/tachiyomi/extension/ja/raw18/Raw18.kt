@@ -4,6 +4,7 @@ import eu.kanade.tachiyomi.multisrc.wpcomics.WPComics
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Document
@@ -17,12 +18,13 @@ abstract class Raw18 : WPComics() {
 
     override val gmtOffset = null
     override val searchPath = "search/manga"
+    override val mangaUrlDirectory = "manga"
 
     override val genresUrlDelimiter = "="
 
-    override fun popularMangaSelector() = "div.items article.item"
+    override fun popularMangaSelector() = "div.items .item"
 
-    override fun popularMangaNextPageSelector() = "li:nth-last-child(2) a.page-link"
+    override fun popularMangaNextPageSelector() = "ul.pagination li.active + li a.page-link"
 
     override fun searchMangaSelector() = popularMangaSelector()
 
@@ -43,7 +45,7 @@ abstract class Raw18 : WPComics() {
             addQueryParameter("page", page.toString())
         }.build()
 
-        return parseMangaPage(client.get(url), searchMangaSelector(), ::searchMangaFromElement)
+        return parseMangaPage(client.get(url, Fetch.DOCUMENT), searchMangaSelector(), ::searchMangaFromElement)
     }
 
     override fun getStatusList(): List<Pair<String?, String>> = listOf(

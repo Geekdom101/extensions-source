@@ -6,14 +6,19 @@ plugins {
 
 keiyoushi {
     name = "Siikomik"
-    versionCode = 0
+    versionCode = 62
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
-    theme = "madara"
+    libVersion = "1.6"
 
     source {
         lang = "id"
-        baseUrl = "https://siikomik.net"
+        baseUrl = "https://siikomik.com"
         versionId = 3
+    }
+
+    deeplink {
+        host("siikomik.com")
+        host("siikomik.id")
+        path("/komik/..*")
     }
 }

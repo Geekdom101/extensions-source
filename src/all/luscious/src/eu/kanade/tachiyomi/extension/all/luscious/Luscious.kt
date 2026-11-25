@@ -1,54 +1,77 @@
 package eu.kanade.tachiyomi.extension.all.luscious
 
 import android.content.SharedPreferences
-import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.post
+import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.MarkdownDescription
+import keiyoushi.utils.firstInstance
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonString
-import okhttp3.Headers
+import keiyoushi.utils.graphQLBody
+import keiyoushi.utils.graphQLGet
+import keiyoushi.utils.parseGraphQLAs
+import keiyoushi.utils.toJsonElement
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
-import rx.Observable
-import kotlin.math.ceil
+import kotlin.time.Duration.Companion.minutes
 
 @Source
 abstract class Luscious :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
-    override val supportsLatest: Boolean = true
-    val lusLang: String get() = toLusLang(lang)
+    private val lusLang: String get() = toLusLang(lang)
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val apiBaseUrl: String get() = "$baseUrl/graphql/nobatch/"
     private val cdnHost: String = "ah-img.luscious.net"
+    private val cdnBaseUrl = "https://$cdnHost/".toHttpUrl()
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
+    override fun OkHttpClient.Builder.configureClient() = addInterceptor(videoGifInterceptor)
+        .addNetworkInterceptor(rewriteOctetStream)
+        .rateLimit(60, 1.minutes) { it.pathSegments.firstOrNull() == "graphql" }
 
-    override val client: OkHttpClient
-        get() = network.client.newBuilder()
-            .addNetworkInterceptor(rewriteOctetStream)
-            .build()
+    // a video's gif is at .gif or .jpg, else the still frame passed in the fragment
+    private val videoGifInterceptor = Interceptor { chain ->
+        val request = chain.request()
+        val url = request.url
+        val name = url.pathSegments.last()
+        if (url.host != cdnHost || !name.endsWith(".gif")) return@Interceptor chain.proceed(request)
+
+        val alternatives = listOfNotNull(
+            url.newBuilder().setPathSegment(url.pathSize - 1, name.removeSuffix(".gif") + ".jpg").build(),
+            url.fragment?.toHttpUrl(),
+        )
+        var response = chain.proceed(request)
+        for (alternative in alternatives) {
+            if (response.code != 404) break
+            response.close()
+            response = chain.proceed(request.newBuilder().url(alternative).build())
+        }
+        response
+    }
 
     private val rewriteOctetStream: Interceptor = Interceptor { chain ->
         val originalResponse: Response = chain.proceed(chain.request())
@@ -65,25 +88,38 @@ abstract class Luscious :
         }
     }
 
-    // Common
+    override suspend fun getPopularManga(page: Int): MangasPage = getAlbumList(page, getSortFilters(POPULAR_DEFAULT_SORT_STATE, lusLang))
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = getAlbumList(page, getSortFilters(LATEST_DEFAULT_SORT_STATE, lusLang))
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = getAlbumList(page, filters, query)
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (!url.host.endsWith(baseUrl.toHttpUrl().host.substringAfter("."))) return null
+        if (url.pathSegments.getOrNull(0) != "albums") return null
+        val album = url.pathSegments.getOrNull(1) ?: return null
+        val manga = SManga.create().apply { this.url = "/albums/$album/" }
+
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+    }
+
     private fun buildAlbumListRequestInput(page: Int, filters: FilterList, query: String = ""): Variables {
-        val sortByFilter = filters.findInstance<SortBySelectFilter>()!!
-        val albumTypeFilter = filters.findInstance<AlbumTypeSelectFilter>()!!
-        val selectionFilter = filters.findInstance<SelectionSelectFilter>()!!
-        val interestsFilter = filters.findInstance<InterestGroupFilter>()!!
-        val languagesFilter = filters.findInstance<LanguageGroupFilter>()!!
-        val tagsFilter = filters.findInstance<TagTextFilters>()!!
-        val creatorFilter = filters.findInstance<CreatorTextFilters>()!!
-        val favoriteFilter = filters.findInstance<FavoriteTextFilters>()!!
-        val genreFilter = filters.findInstance<GenreGroupFilter>()!!
-        val contentTypeFilter = filters.findInstance<ContentTypeSelectFilter>()!!
-        val albumSizeFilter = filters.findInstance<AlbumSizeSelectFilter>()!!
-        val restrictGenresFilter = filters.findInstance<RestrictGenresSelectFilter>()!!
+        val sortByFilter = filters.firstInstance<SortBySelectFilter>()
+        val albumTypeFilter = filters.firstInstance<AlbumTypeSelectFilter>()
+        val selectionFilter = filters.firstInstance<SelectionSelectFilter>()
+        val interestsFilter = filters.firstInstance<InterestGroupFilter>()
+        val languagesFilter = filters.firstInstance<LanguageGroupFilter>()
+        val tagsFilter = filters.firstInstance<TagTextFilters>()
+        val creatorFilter = filters.firstInstance<CreatorTextFilters>()
+        val favoriteFilter = filters.firstInstance<FavoriteTextFilters>()
+        val genreFilter = filters.firstInstance<GenreGroupFilter>()
+        val contentTypeFilter = filters.firstInstance<ContentTypeSelectFilter>()
+        val albumSizeFilter = filters.firstInstance<AlbumSizeSelectFilter>()
+        val restrictGenresFilter = filters.firstInstance<RestrictGenresSelectFilter>()
         return Variables(
             Input(
                 display = sortByFilter.selected,
                 page = page,
-                itemsPerPage = 50,
                 filters = mutableListOf<Filter>().apply {
                     if (contentTypeFilter.selected != FILTER_VALUE_IGNORE) {
                         add(contentTypeFilter.toJsonObject("content_id"))
@@ -112,10 +148,9 @@ abstract class Luscious :
                         add(this.toJsonObject("audience_ids"))
                     }
 
-                    if (lusLang != FILTER_VALUE_IGNORE) {
-                        add(
-                            Filter(name = "language_ids", value = "+" + languagesFilter.selected.joinToString("+")),
-                        )
+                    val languageIds = listOfNotNull(lusLang.takeIf { it != FILTER_VALUE_IGNORE }) + languagesFilter.selected
+                    if (languageIds.isNotEmpty()) {
+                        add(Filter(name = "language_ids", value = languageIds.joinToString("") { "+$it" }))
                     }
 
                     if (tagsFilter.state.isNotEmpty()) {
@@ -165,23 +200,20 @@ abstract class Luscious :
         )
     }
 
-    private fun buildAlbumListRequest(page: Int, filters: FilterList, query: String = ""): Request {
+    private suspend fun getAlbumList(page: Int, filters: FilterList, query: String = ""): MangasPage {
         val input = buildAlbumListRequestInput(page, filters, query)
-        val url = apiBaseUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("operationName", "AlbumList")
-            .addQueryParameter("query", ALBUM_LIST_REQUEST_GQL)
-            .addQueryParameter("variables", input.toJsonString())
-            .build()
-        return GET(url, headers)
-    }
-
-    private fun parseAlbumListResponse(response: Response): MangasPage {
-        val data = response.parseAs<AlbumListResponse>()
-        with(data.data.album.list) {
+        val data = client.graphQLGet(
+            apiBaseUrl,
+            query = ALBUM_LIST_REQUEST_GQL,
+            operationName = "AlbumList",
+            variables = input.toJsonElement(),
+            fetch = Fetch.XHR,
+        ).parseGraphQLAs<AlbumListData>()
+        with(data.album.list) {
             return MangasPage(
                 this.items.map {
                     SManga.create().apply {
-                        url = it.url
+                        this.url = it.url
                         title = it.title
                         thumbnail_url = it.cover.url
                     }
@@ -191,216 +223,43 @@ abstract class Luscious :
         }
     }
 
-    private fun buildAlbumInfoRequestInput(id: String): SingleIdVariable = SingleIdVariable(
-        id = id,
-    )
+    private suspend fun getAlbumInfo(id: String): FullAlbum = client.graphQLGet(
+        apiBaseUrl,
+        query = albumInfoQuery,
+        operationName = "AlbumGet",
+        variables = SingleIdVariable(id).toJsonElement(),
+        fetch = Fetch.XHR,
+    ).parseGraphQLAs<AlbumGetData>().album.get
 
-    private fun buildAlbumInfoRequest(id: String): Request {
-        val input = buildAlbumInfoRequestInput(id)
-        val url = apiBaseUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("operationName", "AlbumGet")
-            .addQueryParameter("query", albumInfoQuery)
-            .addQueryParameter("variables", input.toJsonString())
-            .build()
-        return GET(url, headers)
-    }
-
-    private fun buildAlbumListRelatedRequestInput(id: String) = buildAlbumInfoRequestInput(id)
-
-    private fun buildAlbumListRelatedRequest(id: String): Request {
-        val input = buildAlbumListRelatedRequestInput(id)
-        val url = apiBaseUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("operationName", "AlbumListRelated")
-            .addQueryParameter("query", albumListRelatedQuery)
-            .addQueryParameter("variables", input.toJsonString())
-            .build()
-        return GET(url, headers)
-    }
-
-    // Latest
-
-    override fun latestUpdatesRequest(page: Int): Request = buildAlbumListRequest(page, getSortFilters(LATEST_DEFAULT_SORT_STATE, lusLang))
-
-    override fun latestUpdatesParse(response: Response): MangasPage = parseAlbumListResponse(response)
-
-    // Chapters
-
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
         val id = manga.url.substringAfterLast("_").removeSuffix("/")
+        val album = getAlbumInfo(id)
 
-        return client.newCall(buildAlbumInfoRequest(id))
-            .asObservableSuccess()
-            .map { response ->
-                val album = response.parseAs<AlbumGetResponse>().data.album.get
-                val totalPictures = album.numberOfPictures
-
-                if (getMergeChapterPref()) {
-                    val chapters = mutableListOf<SChapter>()
-                    val chunkCount = ceil(totalPictures / 1000.0).toInt().coerceAtLeast(1)
-
-                    for (i in 1..chunkCount) {
-                        val chapter = SChapter.create()
-                        chapter.url = "${manga.url}?chunk=$i"
-                        chapter.name = if (chunkCount == 1) "Merged Chapter" else "Merged Chapter (Part $i)"
-                        chapter.chapter_number = i.toFloat()
-                        chapter.date_upload = (album.created?.toLong() ?: 0L) * 1000L
-                        chapters.add(chapter)
-                    }
-                    chapters.reversed()
-                } else {
-                    val chapters = mutableListOf<SChapter>()
-                    var page = 1
-                    var hasMore = true
-
-                    while (hasMore) {
-                        val newPage = client.newCall(GET(buildAlbumPicturesPageUrl(id, page))).execute()
-                        val data = newPage.parseAs<AlbumListOwnPicturesResponse>()
-                        val pictureItems = parsePictures(data)
-
-                        if (pictureItems.isEmpty()) {
-                            hasMore = false
-                        } else {
-                            pictureItems.forEach {
-                                val chapter = SChapter.create().apply {
-                                    chapter_number = it.index.toFloat()
-                                    name = "${it.index} - ${it.title}"
-                                    date_upload = (it.created ?: 0L) * 1000L
-                                }
-                                chapter.setUrlWithoutDomain(it.url)
-                                chapters.add(chapter)
-                            }
-
-                            // API natively caps `total_items` tracking to 1000 so we override that by
-                            // directly tracking standard math iteration against the true `numberOfPictures`
-                            if (page * 50 >= totalPictures || data.data.picture.list.items.isEmpty()) {
-                                hasMore = false
-                            } else {
-                                page++
-                            }
-                        }
-                    }
-                    chapters.reversed()
-                }
-            }
-    }
-
-    private fun getPictureUrl(picture: Picture) = when {
-        getResolutionPref() != "-1" -> {
-            picture.thumbnails[getResolutionPref()?.toInt()!!].url
+        val chapterList = when {
+            !fetchChapters -> chapters
+            getPerPicturePref() -> getPictureChapters(id, album)
+            else -> getChapters(manga, album, chapters)
         }
 
-        picture.urlToVideo != null -> {
-            picture.urlToVideo.replace(".mp4", ".gif")
-        }
-
-        picture.urlToOriginal != null -> {
-            picture.urlToOriginal
-        }
-
-        else -> {
-            picture.thumbnails.maxByOrNull { thumbnail ->
-                thumbnail.height * thumbnail.width
-            }!!.url
-        }
+        return SMangaUpdate(detailsParse(album).apply { url = manga.url }, chapterList)
     }
 
-    private fun parsePictures(data: AlbumListOwnPicturesResponse): List<PictureItem> {
-        val items = mutableListOf<PictureItem>()
-
-        data.data.picture.list.items.forEach {
-            val index = it.position
-            val url = getPictureUrl(it)
-
-            items.add(PictureItem(index, if (url.startsWith("//")) "https:$url" else url, it.title, it.created.toLong()))
-        }
-
-        return items
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
-
-    // Pages
-
-    private fun buildAlbumPicturesRequestInput(id: String, page: Int): Variables = Variables(
-        input = Input(
-            filters = listOf(
-                Filter(name = "album_id", value = id),
-            ),
-            display = getSortPref(),
-            page = page,
-            itemsPerPage = 50,
-        ),
-    )
-
-    private fun buildAlbumPicturesPageUrl(id: String, page: Int): HttpUrl {
-        val input = buildAlbumPicturesRequestInput(id, page)
-        return apiBaseUrl.toHttpUrl().newBuilder()
-            .addQueryParameter("operationName", "AlbumListOwnPictures")
-            .addQueryParameter("query", ALBUM_PICTURES_REQUEST_GQL)
-            .addQueryParameter("variables", input.toJsonString())
-            .build()
-    }
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = if (chapter.url.startsWith("/albums/")) {
-        val chunk = chapter.url.substringAfter("?chunk=", "1").substringBefore("#").toIntOrNull() ?: 1
-        val id = chapter.url.substringBefore("?").substringAfterLast("_").removeSuffix("/")
-
-        Observable.fromCallable {
-            val pages = mutableListOf<Page>()
-            val startPage = (chunk - 1) * 20 + 1
-            val endPage = chunk * 20
-
-            for (page in startPage..endPage) {
-                val response = client.newCall(GET(buildAlbumPicturesPageUrl(id, page))).execute()
-                val data = response.parseAs<AlbumListOwnPicturesResponse>()
-                val pictureItems = parsePictures(data)
-
-                if (pictureItems.isEmpty()) break
-
-                pictureItems.forEach {
-                    pages.add(Page(pages.size, imageUrl = it.url.toHttpUrl().newBuilder().host(cdnHost).build().toString()))
-                }
-
-                if (pictureItems.size < 50) break
-            }
-            pages
-        }
-    } else {
-        Observable.just(listOf(Page(0, imageUrl = "https://$cdnHost${chapter.url}")))
-    }
-
-    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException()
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    override fun fetchImageUrl(page: Page): Observable<String> = throw UnsupportedOperationException()
-
-    override fun getChapterUrl(chapter: SChapter): String = if (chapter.url.startsWith("/albums/")) {
-        "$baseUrl${chapter.url.substringBefore("?")}"
-    } else {
-        "https://$cdnHost${chapter.url}"
-    }
-
-    // Details
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", headers)
-
-    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
-        val id = manga.url.substringAfterLast("_").removeSuffix("/")
-        return client.newCall(buildAlbumInfoRequest(id))
-            .asObservableSuccess()
-            .map { detailsParse(it) }
-    }
-
-    private fun detailsParse(response: Response): SManga {
-        val data = response.parseAs<AlbumGetResponse>().data.album.get
+    private fun detailsParse(data: FullAlbum): SManga {
         val manga = SManga.create()
         manga.url = data.url
         manga.title = data.title
         manga.thumbnail_url = data.cover.url
-        manga.status = 0
-        manga.description = "${data.description}\n\nPictures: ${data.numberOfPictures}\nAnimated Pictures: ${data.numberOfAnimatedPictures}"
-        val genreList = mutableListOf(data.language?.title)
+        manga.description = MarkdownDescription.Builder()
+            .description(data.description)
+            .field("Pictures", data.numberOfPictures.toString())
+            .field("Animated Pictures", data.numberOfAnimatedPictures.toString())
+            .build()
+        val genreList = listOfNotNull(data.language?.title).toMutableList()
         genreList += data.labels
         genreList += data.genres.map { it.title }
         genreList += data.audiences.map { it.title }
@@ -411,23 +270,23 @@ abstract class Luscious :
             manga.author = manga.artist
         }
         genreList += data.content.title
-        manga.genre = genreList.joinToString(", ")
+        manga.genre = genreList.joinToString()
 
         return manga
     }
 
-    override fun mangaDetailsParse(response: Response): SManga = throw UnsupportedOperationException()
+    override val supportsRelatedMangas get() = true
 
-    // Related
-
-    override fun relatedMangaListRequest(manga: SManga): Request {
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
         val id = manga.url.substringAfterLast("_").removeSuffix("/")
-        return buildAlbumListRelatedRequest(id)
-    }
-
-    override fun relatedMangaListParse(response: Response): List<SManga> {
-        val data = response.parseAs<AlbumRelatedResponse>()
-        with(data.data.album.listRelated) {
+        val data = client.graphQLGet(
+            apiBaseUrl,
+            query = albumListRelatedQuery,
+            operationName = "AlbumListRelated",
+            variables = SingleIdVariable(id).toJsonElement(),
+            fetch = Fetch.XHR,
+        ).parseGraphQLAs<AlbumRelatedData>()
+        with(data.album.listRelated) {
             return listOfNotNull(
                 moreLikeThis,
                 itemsLikedLikeThis,
@@ -435,7 +294,7 @@ abstract class Luscious :
             ).flatMap { relatedItems ->
                 relatedItems.map {
                     SManga.create().apply {
-                        url = it.url
+                        this.url = it.url
                         title = it.title
                         thumbnail_url = it.cover.url
                     }
@@ -444,48 +303,189 @@ abstract class Luscious :
         }
     }
 
-    // Popular
+    // pictures from..to of the album, 1-based in upload order
+    private class Part(val from: Int, val to: Int, val url: String, val date: Long)
 
-    override fun popularMangaParse(response: Response): MangasPage = parseAlbumListResponse(response)
-
-    override fun popularMangaRequest(page: Int): Request = buildAlbumListRequest(page, getSortFilters(POPULAR_DEFAULT_SORT_STATE, lusLang))
-
-    // Search
-
-    override fun searchMangaParse(response: Response): MangasPage = parseAlbumListResponse(response)
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = buildAlbumListRequest(
-        page,
-        filters.let {
-            if (it.isEmpty()) {
-                getSortFilters(SEARCH_DEFAULT_SORT_STATE, lusLang)
-            } else {
-                it
-            }
-        },
-        query,
-    )
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = if (query.startsWith("https://")) {
-        val url = query.toHttpUrl()
-        val album = url.pathSegments[1]
-        fetchSearchManga(page, "ALBUM:$album", filters)
-    } else if (query.startsWith("ID:")) {
-        val id = query.substringAfterLast("ID:")
-        client.newCall(buildAlbumInfoRequest(id))
-            .asObservableSuccess()
-            .map { MangasPage(listOf(detailsParse(it)), false) }
-    } else if (query.startsWith("ALBUM:")) {
-        val album = query.substringAfterLast("ALBUM:")
-        val id = album.split("_").last()
-        client.newCall(buildAlbumInfoRequest(id))
-            .asObservableSuccess()
-            .map { MangasPage(listOf(detailsParse(it)), false) }
-    } else {
-        super.fetchSearchManga(page, query, filters)
+    private fun part(chapter: SChapter): Part {
+        val url = baseUrl.toHttpUrl().resolve(chapter.url)!!
+        // ?chunk=N parts of earlier versions
+        val chunk = url.queryParameter("chunk")?.toInt()
+        if (chunk != null) {
+            return Part((chunk - 1) * PICTURES_PER_CHAPTER + 1, chunk * PICTURES_PER_CHAPTER, chapter.url, chapter.date_upload)
+        }
+        return Part(url.queryParameter("from")!!.toInt(), url.queryParameter("to")!!.toInt(), chapter.url, chapter.date_upload)
     }
 
-    override fun getFilterList(): FilterList = getSortFilters(POPULAR_DEFAULT_SORT_STATE, lusLang)
+    private fun partUrl(manga: SManga, from: Int, to: Int): String {
+        val url = baseUrl.toHttpUrl().resolve(manga.url)!!.newBuilder()
+            .addQueryParameter("from", from.toString())
+            .addQueryParameter("to", to.toString())
+            .build()
+        return "${url.encodedPath}?${url.encodedQuery}"
+    }
+
+    private fun getChapters(manga: SManga, album: FullAlbum, chapters: List<SChapter>): List<SChapter> {
+        val total = album.numberOfPictures
+        val created = (album.created?.toLong() ?: 0L) * 1000L
+        val modified = (album.modified?.toLong() ?: 0L) * 1000L
+
+        // one-picture chapters, of older versions or the per-picture setting, are dropped
+        val listed = chapters.filter { it.url.startsWith("/albums/") }.map { chapter ->
+            val part = part(chapter)
+            // a ?chunk= part past the album's end now ends there, so later pictures get their own chapter
+            if (part.to > total && "chunk=" in part.url) {
+                val to = maxOf(total, part.from)
+                Part(part.from, to, partUrl(manga, part.from, to), part.date)
+            } else {
+                part
+            }
+        }
+
+        val listedEnd = listed.maxOfOrNull { it.to } ?: 0
+        val added = (listedEnd + 1..total step PICTURES_PER_CHAPTER).map { from ->
+            val to = minOf(from + PICTURES_PER_CHAPTER - 1, total)
+            // on a first listing only the newest part dates from the album's last upload
+            val date = if (listed.isEmpty() && to < total) created else modified
+            Part(from, to, partUrl(manga, from, to), date)
+        }
+
+        val parts = (listed + added).sortedBy { it.from }
+        return parts.mapIndexed { i, part ->
+            SChapter.create().apply {
+                url = part.url
+                name = if (parts.size == 1) "Chapter" else "Part ${i + 1}"
+                chapter_number = (i + 1).toFloat()
+                date_upload = part.date
+            }
+        }.reversed()
+    }
+
+    private suspend fun getPictureChapters(id: String, album: FullAlbum): List<SChapter> {
+        val pictures = getPictures(id, album.numberOfPictures, 1, album.numberOfPictures, CHAPTER_FIELDS)
+        return pictures.map { (i, picture) ->
+            SChapter.create().apply {
+                url = picture.url!!
+                name = listOfNotNull(i, picture.title).joinToString(" - ")
+                chapter_number = i.toFloat()
+                date_upload = (picture.created?.toLong() ?: 0L) * 1000L
+            }
+        }.reversed()
+    }
+
+    private data class PicturePage(val display: String, val page: Int)
+
+    // pages of the album's picture list, several per request
+    private suspend fun getPicturePages(id: String, pages: List<PicturePage>, fields: String): Map<PicturePage, List<Picture>> = coroutineScope {
+        pages.chunked(PAGES_PER_REQUEST).map { batch ->
+            async {
+                val query = buildString {
+                    append("query AlbumListOwnPictures(")
+                    append(batch.indices.joinToString { "\$p$it: PictureListInput!" })
+                    append(") { picture { ")
+                    batch.indices.forEach { append("p$it: list(input: \$p$it) { items { $fields } } ") }
+                    append("} }")
+                }
+                val variables = batch.withIndex().associate { (i, page) ->
+                    "p$i" to Input(
+                        display = page.display,
+                        page = page.page,
+                        itemsPerPage = PICTURES_PER_PAGE,
+                        filters = listOf(Filter(name = "album_id", value = id)),
+                    )
+                }
+                val body = graphQLBody(query, "AlbumListOwnPictures", variables)
+                val lists = client.post(apiBaseUrl, Fetch.XHR, body).parseGraphQLAs<PictureListsData>().picture
+                batch.withIndex().associate { (i, page) -> page to lists.getValue("p$i").items }
+            }
+        }.awaitAll().fold(emptyMap()) { all, batch -> all + batch }
+    }
+
+    // the album's pictures from..to, each with its index
+    private suspend fun getPictures(id: String, total: Int, from: Int, to: Int, fields: String): List<IndexedValue<Picture>> {
+        // anonymous lists stop after 1000 pictures in either order, so later ones come from the newest end
+        val slots = (from..to).associateWith { i ->
+            if (i > PICTURES_PER_CHAPTER && total - i < PICTURES_PER_CHAPTER) {
+                PicturePage("date_newest", (total - i) / PICTURES_PER_PAGE + 1) to (total - i) % PICTURES_PER_PAGE
+            } else {
+                PicturePage("date_oldest", (i - 1) / PICTURES_PER_PAGE + 1) to (i - 1) % PICTURES_PER_PAGE
+            }
+        }
+        val pages = getPicturePages(id, slots.values.map { it.first }.distinct(), fields)
+        return slots.mapNotNull { (i, slot) -> pages.getValue(slot.first).getOrNull(slot.second)?.let { IndexedValue(i, it) } }
+    }
+
+    // uncached, unlike AlbumGet over GET
+    private suspend fun getPictureCount(id: String): Int {
+        val body = graphQLBody(PICTURE_COUNT_QUERY, "AlbumGet", SingleIdVariable(id))
+        return client.post(apiBaseUrl, Fetch.XHR, body).parseGraphQLAs<PictureCountData>().album.get.numberOfPictures
+    }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        if (chapter.url.startsWith("/pictures/")) {
+            val segments = baseUrl.toHttpUrl().resolve(chapter.url)!!.pathSegments
+            val pictureId = segments[segments.indexOf("id") + 1]
+            val picture = client.graphQLGet(
+                apiBaseUrl,
+                query = PICTURE_GET_QUERY,
+                operationName = "PictureGet",
+                variables = SingleIdVariable(pictureId).toJsonElement(),
+                fetch = Fetch.XHR,
+            ).parseGraphQLAs<PictureGetData>().picture.get
+            if (picture.urlToVideo == null && picture.urlToOriginal == null && picture.thumbnails.isEmpty()) throw Exception("Picture not found")
+            return listOf(Page(0, imageUrl = getPictureUrl(picture)))
+        }
+        // one-picture chapters of older versions
+        if (!chapter.url.startsWith("/albums/")) throw Exception("Refresh the chapter list")
+
+        val id = baseUrl.toHttpUrl().resolve(chapter.url)!!.pathSegments[1].substringAfterLast("_")
+        val part = part(chapter)
+        // only pictures past the first 1000 need the current count
+        val total = if (part.to > PICTURES_PER_CHAPTER) getPictureCount(id) else part.to
+        val to = minOf(part.to, total)
+        if (part.from > to) return emptyList()
+
+        val pictures = getPictures(id, total, part.from, to, PAGE_FIELDS)
+        if (pictures.isEmpty()) throw Exception("Log in via WebView to view more than 1000 pictures")
+
+        return pictures.mapIndexed { i, (_, picture) ->
+            Page(i, imageUrl = getPictureUrl(picture))
+        }
+    }
+
+    override fun getChapterUrl(chapter: SChapter): String = baseUrl.toHttpUrl().resolve(chapter.url)!!.newBuilder().query(null).build().toString()
+
+    private fun getPictureUrl(picture: Picture): String = when {
+        // gif of a video, unsigned on the image host
+        picture.urlToVideo != null -> {
+            val video = picture.urlToVideo.resolved()
+            val still = picture.thumbnails.largest()?.url?.resolved()
+            video.newBuilder()
+                .host(cdnHost)
+                .query(null)
+                .setPathSegment(video.pathSize - 1, video.pathSegments.last().removeSuffix(".mp4") + ".gif")
+                .fragment(still?.toString())
+                .build()
+        }
+
+        getResolutionPref() != "-1" -> {
+            val size = RESOLUTION_SIZES.getValue(getResolutionPref())
+            (picture.thumbnails.find { it.size == size } ?: picture.thumbnails.largest()!!).url.resolved()
+        }
+
+        picture.urlToOriginal != null -> {
+            picture.urlToOriginal.resolved()
+        }
+
+        else -> {
+            picture.thumbnails.largest()!!.url.resolved()
+        }
+    }.toString()
+
+    private fun List<Cover>.largest(): Cover? = maxByOrNull { it.height * it.width }
+
+    private fun String.resolved(): HttpUrl = cdnBaseUrl.resolve(this)!!
+
+    override fun getFilterList(data: JsonElement?): FilterList = getSortFilters(POPULAR_DEFAULT_SORT_STATE, lusLang)
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val resolutionPref = ListPreference(screen.context).apply {
@@ -495,46 +495,18 @@ abstract class Luscious :
             entryValues = RESOLUTION_PREF_ENTRY_VALUES
             setDefaultValue(RESOLUTION_PREF_DEFAULT_VALUE)
             summary = "%s"
-
-            setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString("${RESOLUTION_PREF_KEY}_$lang", entry).commit()
-            }
         }
-        val sortPref = ListPreference(screen.context).apply {
-            key = "${SORT_PREF_KEY}_$lang"
-            title = SORT_PREF_TITLE
-            entries = SORT_PREF_ENTRIES
-            entryValues = SORT_PREF_ENTRY_VALUES
-            setDefaultValue(SORT_PREF_DEFAULT_VALUE)
-            summary = "%s"
-
-            setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString("${SORT_PREF_KEY}_$lang", entry).commit()
-            }
-        }
-        val mergeChapterPref = CheckBoxPreference(screen.context).apply {
-            key = "${MERGE_CHAPTER_PREF_KEY}_$lang"
-            title = MERGE_CHAPTER_PREF_TITLE
-            summary = MERGE_CHAPTER_PREF_SUMMARY
-            setDefaultValue(MERGE_CHAPTER_PREF_DEFAULT_VALUE)
-
-            setOnPreferenceChangeListener { _, newValue ->
-                val checkValue = newValue as Boolean
-                preferences.edit().putBoolean("${MERGE_CHAPTER_PREF_KEY}_$lang", checkValue).commit()
-            }
+        val perPicturePref = SwitchPreferenceCompat(screen.context).apply {
+            key = "${PER_PICTURE_PREF_KEY}_$lang"
+            title = PER_PICTURE_PREF_TITLE
+            summary = PER_PICTURE_PREF_SUMMARY
+            setDefaultValue(false)
         }
         screen.addPreference(resolutionPref)
-        screen.addPreference(sortPref)
-        screen.addPreference(mergeChapterPref)
+        screen.addPreference(perPicturePref)
     }
 
-    fun getMergeChapterPref(): Boolean = preferences.getBoolean("${MERGE_CHAPTER_PREF_KEY}_$lang", MERGE_CHAPTER_PREF_DEFAULT_VALUE)
-    fun getResolutionPref(): String? = preferences.getString("${RESOLUTION_PREF_KEY}_$lang", RESOLUTION_PREF_DEFAULT_VALUE)
-    fun getSortPref(): String? = preferences.getString("${SORT_PREF_KEY}_$lang", SORT_PREF_DEFAULT_VALUE)
+    private fun getPerPicturePref(): Boolean = preferences.getBoolean("${PER_PICTURE_PREF_KEY}_$lang", false)
+
+    private fun getResolutionPref(): String = preferences.getString("${RESOLUTION_PREF_KEY}_$lang", RESOLUTION_PREF_DEFAULT_VALUE)!!
 }
